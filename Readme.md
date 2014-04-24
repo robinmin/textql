@@ -6,6 +6,7 @@ This is my fork on [dinedal/textql](https://github.com/dinedal/textql). The majo
   - Add two new options on command line:
   	* pk		- Enable end user can provide primary key information during table creation;
   	* ori_op	- How to deal with the duplicated records. This option will work only with valid pk . Must be one of (replace/rollback/abord/fail/ignore/)
+  	* ori_op	- Show variable summary after imported the data
   - Add more information output in verbose mode, to enable user understand the full process result more clearly;
 
 ### TODO ###

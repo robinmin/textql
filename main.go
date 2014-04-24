@@ -41,6 +41,15 @@ type TableSchema struct {
 	Fields []FieldDefinition
 }
 
+type FieldSummary struct {
+	var_name   string
+	min_length int
+	max_length int
+	distinct   int
+	min_val    string
+	max_var    string
+}
+
 func main() {
 	// Parse command line opts
 	commands := flag.String("sql", "", "SQL Command(s) to run on the data")
@@ -48,6 +57,7 @@ func main() {
 	delimiter := flag.String("dlm", ",", "Delimiter between fields -dlm=tab for tab, -dlm=0x## to specify a character code in hex")
 	pks := flag.String("pk", "", "Primary key(s) for imported table, seperated by the seperator witch specified by dlm option")
 	ori_op := flag.String("dup", "", "How to deal with the duplicated records. This option will work only with pk valid. Must be one of (replace/rollback/abord/fail/ignore/)")
+	showvar := flag.Bool("showvar", false, "Show variable summary after imported the data")
 	header := flag.Bool("header", false, "Treat file as having the first row as a header row")
 	tableName := flag.String("table-name", "tbl", "Override the default table name (tbl)")
 	save_to := flag.String("save-to", "", "If set, sqlite3 db is left on disk at this path")
@@ -155,6 +165,23 @@ func main() {
 
 	if *verbose {
 		fmt.Fprintf(os.Stderr, "\n#of row : %d + %d ==> %d (%v)\n", nBefore, nLines, nAfter, t1.Sub(t0))
+	}
+	if *showvar {
+		fmt.Fprintf(os.Stderr, "\nField\tMin.Length\tMax.Length\tDistinct\tMin.Value\tMax.Value\n")
+		var tmpFldSum *FieldSummary
+		for _, column := range schema.Fields {
+			tmpFldSum = SummaryTableByField(db, *tableName, column.field_name)
+			fmt.Fprintf(
+				os.Stderr, "%v\t%d\t%d\t%d\t%v\t%v\n",
+				tmpFldSum.var_name,
+				tmpFldSum.min_length,
+				tmpFldSum.max_length,
+				tmpFldSum.distinct,
+				tmpFldSum.min_val,
+				tmpFldSum.max_var,
+			)
+		}
+		fmt.Fprintf(os.Stderr, "\n")
 	}
 
 	// Determine what sql to execute
@@ -477,4 +504,33 @@ func FetchTableSchema(db *sql.DB, table string) *TableSchema {
 		counter++
 	}
 	return schema
+}
+
+func SummaryTableByField(db *sql.DB, table string, field string) *FieldSummary {
+	strSQL := `select
+		min(length(` + field + `)) as len_min,
+		max(length(` + field + `)) as len_max,
+		count(distinct ` + field + `) as var_dist,
+		min(` + field + `) as var_min,
+		max(` + field + `) as var_max
+	from ` + table
+	rows, err := db.Query(strSQL)
+	if err != nil {
+		log.Fatalln("Failed to summary table(", table, ") on : ", field)
+		log.Fatalln(err.Error())
+		return nil
+	}
+	defer rows.Close()
+
+	result := new(FieldSummary)
+	result.var_name = field
+	rows.Next()
+	rows.Scan(
+		&result.min_length,
+		&result.max_length,
+		&result.distinct,
+		&result.min_val,
+		&result.max_var,
+	)
+	return result
 }
