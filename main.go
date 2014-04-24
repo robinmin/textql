@@ -24,11 +24,30 @@ import (
 	"unicode/utf8"
 )
 
+const (
+	NUM_PER_DOT = 10000
+)
+
+type FieldDefinition struct {
+	cid        int
+	field_name string
+	field_type string
+	notnull    int
+	dflt_value string
+	pk         int
+}
+
+type TableSchema struct {
+	Fields []FieldDefinition
+}
+
 func main() {
 	// Parse command line opts
 	commands := flag.String("sql", "", "SQL Command(s) to run on the data")
 	source_text := flag.String("source", "stdin", "Source file to load, or defaults to stdin")
 	delimiter := flag.String("dlm", ",", "Delimiter between fields -dlm=tab for tab, -dlm=0x## to specify a character code in hex")
+	pks := flag.String("pk", "", "Primary key(s) for imported table, seperated by the seperator witch specified by dlm option")
+	ori_op := flag.String("dup", "", "How to deal with the duplicated records. This option will work only with pk valid. Must be one of (replace/rollback/abord/fail/ignore/)")
 	header := flag.Bool("header", false, "Treat file as having the first row as a header row")
 	tableName := flag.String("table-name", "tbl", "Override the default table name (tbl)")
 	save_to := flag.String("save-to", "", "If set, sqlite3 db is left on disk at this path")
@@ -41,6 +60,8 @@ func main() {
 	}
 
 	seperator := determineSeperator(delimiter)
+	primarykeys := determinePKs(pks, ",")
+	vld_op := determineDupOp(ori_op)
 
 	// Open db, in memory if possible
 	db, openPath := openDB(save_to, console)
@@ -79,11 +100,11 @@ func main() {
 	}
 
 	// Create the table to load to
-	createTable(tableName, &headerRow, db, verbose)
+	createTable(tableName, &headerRow, db, primarykeys, verbose)
 
 	// Start the clock for importing
 	t0 := time.Now()
-
+	nBefore := countTable(db, *tableName, "")
 	// Create transaction
 	tx, tx_err := db.Begin()
 
@@ -91,11 +112,28 @@ func main() {
 		log.Fatalln(tx_err)
 	}
 
+	// check whethere this table has PK or not
+	blWithPK := false
+	schema := FetchTableSchema(db, *tableName)
+	for _, column := range schema.Fields {
+		if column.pk > 0 {
+			blWithPK = true
+		}
+	}
+	///////////////////////////////////////////////////////////////////////////////
+	// TODO :  there is a bug in current version given the result of `pragma table_info('table_name')` can not
+	//         fetch the pk information correctly, so add an ad-hoc detection here
+	if len(primarykeys) > 0 {
+		blWithPK = true
+	}
+	///////////////////////////////////////////////////////////////////////////////
+
 	// Load first row
-	stmt := createLoadStmt(tableName, &headerRow, tx)
+	stmt := createLoadStmt(tableName, &headerRow, vld_op, blWithPK, tx, verbose)
 	loadRow(tableName, &first_row, tx, stmt, verbose)
 
 	// Read the data
+	nLines := 1
 	for {
 		row, file_err := reader.Read()
 		if file_err == io.EOF {
@@ -103,16 +141,20 @@ func main() {
 		} else if file_err != nil {
 			log.Println(file_err)
 		} else {
+			nLines++
 			loadRow(tableName, &row, tx, stmt, verbose)
+			if *verbose && nLines%NUM_PER_DOT == 0 {
+				fmt.Fprintf(os.Stderr, ".")
+			}
 		}
 	}
 	stmt.Close()
 	tx.Commit()
-
+	nAfter := countTable(db, *tableName, "")
 	t1 := time.Now()
 
 	if *verbose {
-		fmt.Fprintf(os.Stderr, "Data loaded in: %v\n", t1.Sub(t0))
+		fmt.Fprintf(os.Stderr, "\n#of row : %d + %d ==> %d (%v)\n", nBefore, nLines, nAfter, t1.Sub(t0))
 	}
 
 	// Determine what sql to execute
@@ -165,7 +207,7 @@ func main() {
 	}
 }
 
-func createTable(tableName *string, columnNames *[]string, db *sql.DB, verbose *bool) error {
+func createTable(tableName *string, columnNames *[]string, db *sql.DB, primarykeys []string, verbose *bool) error {
 	var buffer bytes.Buffer
 
 	buffer.WriteString("CREATE TABLE IF NOT EXISTS " + (*tableName) + " (")
@@ -184,13 +226,26 @@ func createTable(tableName *string, columnNames *[]string, db *sql.DB, verbose *
 
 		if i != len(*columnNames)-1 {
 			buffer.WriteString(", ")
+		} else {
+			if len(primarykeys) > 0 {
+				buffer.WriteString(", primary key(")
+				for idx, fld := range primarykeys {
+					buffer.WriteString(fld)
+					if idx != len(primarykeys)-1 {
+						buffer.WriteString(", ")
+					}
+				}
+				buffer.WriteString(")")
+			}
 		}
 	}
 
 	buffer.WriteString(");")
+	if *verbose {
+		fmt.Println(buffer.String())
+	}
 
 	_, err := db.Exec(buffer.String())
-
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -198,13 +253,18 @@ func createTable(tableName *string, columnNames *[]string, db *sql.DB, verbose *
 	return err
 }
 
-func createLoadStmt(tableName *string, values *[]string, db *sql.Tx) *sql.Stmt {
+func createLoadStmt(tableName *string, values *[]string, vld_op string, blWithPK bool, db *sql.Tx, verbose *bool) *sql.Stmt {
 	if len(*values) == 0 {
 		log.Fatalln("Nothing to build insert with!")
 	}
 	var buffer bytes.Buffer
 
-	buffer.WriteString("INSERT INTO " + (*tableName) + " VALUES (")
+	buffer.WriteString("INSERT ")
+
+	if len(vld_op) > 0 && blWithPK {
+		buffer.WriteString(" OR " + vld_op + " ")
+	}
+	buffer.WriteString(" INTO " + (*tableName) + " VALUES (")
 	for i := range *values {
 		buffer.WriteString("?")
 		if i != len(*values)-1 {
@@ -212,6 +272,10 @@ func createLoadStmt(tableName *string, values *[]string, db *sql.Tx) *sql.Stmt {
 		}
 	}
 	buffer.WriteString(");")
+	if *verbose {
+		fmt.Println(buffer.String())
+	}
+
 	stmt, err := db.Prepare(buffer.String())
 	if err != nil {
 		log.Fatalln(err)
@@ -344,4 +408,73 @@ func determineSeperator(delimiter *string) rune {
 		seperator, _ = utf8.DecodeRuneInString(*delimiter)
 	}
 	return seperator
+}
+
+func determinePKs(pks *string, seperator string) []string {
+	pk := []string{}
+	tmp := strings.Split(*pks, seperator)
+	for _, fld := range tmp {
+		if len(strings.TrimSpace(fld)) > 0 {
+			pk = append(pk, strings.TrimSpace(fld))
+		}
+	}
+	return pk
+}
+
+func determineDupOp(ori_op *string) string {
+	// all valiable duplication-operator
+	all_ops := []string{
+		"replace",
+		"rollback",
+		"abord",
+		"fail",
+		"ignore",
+	}
+	rtn := ""
+	tmp := strings.ToLower(strings.TrimSpace(*ori_op))
+	for _, item := range all_ops {
+		if item == tmp {
+			rtn = tmp
+			break
+		}
+	}
+	return rtn
+}
+
+func countTable(db *sql.DB, strTable string, strCondition string) int {
+	strSQL := "select count(*) as N_COUNT from " + strTable
+	if len(strCondition) > 0 {
+		strSQL += " where " + strCondition
+	}
+	rows, err := db.Query(strSQL)
+	if err != nil {
+		log.Fatalln("Failed to count records on table("+strCondition+"):", err)
+	}
+	defer rows.Close()
+
+	rows.Next()
+
+	result := 0
+	rows.Scan(&result)
+	return result
+}
+
+func FetchTableSchema(db *sql.DB, table string) *TableSchema {
+	rows, err := db.Query("pragma table_info('" + table + "')")
+	if err != nil {
+		log.Fatalln("Failed to fetch table schema from database : ", table)
+		log.Fatalln(err.Error())
+		return nil
+	}
+	defer rows.Close()
+
+	schema := new(TableSchema)
+	var tmpFld FieldDefinition
+	counter := 0
+	for rows.Next() {
+		rows.Scan(&tmpFld.cid, &tmpFld.field_name, &tmpFld.field_type, &tmpFld.notnull, &tmpFld.dflt_value, &tmpFld.pk)
+		schema.Fields = append(schema.Fields, tmpFld)
+		counter++
+	}
+	return schema
 }
